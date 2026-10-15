@@ -483,14 +483,11 @@ describe("runner R2 cache", () => {
     });
   });
 
-  it("reports a pending JIT assignment without granting cache access", async () => {
+  it("lets an unconfirmed JIT job run while denying cache access", async () => {
     const bucket = actionCacheBucket();
     const environment = actionCacheEnvironment(bucket);
     const cacheAssignment = vi.fn<(runnerName: string, repository: string) => Promise<TestCacheAssignmentResult>>();
-    cacheAssignment.mockResolvedValueOnce(undefined).mockResolvedValue({
-      jobId: "assigned-job",
-      cacheScope: { scope: "refs/pull/2/merge", writeAllowed: true },
-    });
+    cacheAssignment.mockResolvedValue(undefined);
     const writeAuthorizer = {
       cacheAssignment,
     };
@@ -500,8 +497,16 @@ describe("runner R2 cache", () => {
       environment,
       writeAuthorizer,
     );
-    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.status).toBe(200);
+    await expect(unauthorized.json()).resolves.toEqual({ ok: false, cache: false });
     expect(cacheAssignment).not.toHaveBeenCalled();
+
+    const unauthorizedLookup = await handleRunnerCacheV2Request(
+      new Request("https://runner.example/v1/runner-cache-v2/lookup", { method: "POST" }),
+      environment,
+      writeAuthorizer,
+    );
+    expect(unauthorizedLookup.status).toBe(401);
 
     const pending = await handleRunnerCacheV2Request(
       new Request("https://runner.example/v1/runner-cache-v2/assignment", {
@@ -510,8 +515,24 @@ describe("runner R2 cache", () => {
       environment,
       writeAuthorizer,
     );
-    expect(pending.status).toBe(202);
-    await expect(pending.json()).resolves.toEqual({ ok: false });
+    expect(pending.status).toBe(200);
+    await expect(pending.json()).resolves.toEqual({ ok: false, cache: false });
+    expect(cacheAssignment).toHaveBeenCalledTimes(4);
+
+    const unassignedLookup = await handleRunnerCacheV2Request(
+      new Request("https://runner.example/v1/runner-cache-v2/lookup", {
+        method: "POST",
+        headers: { Authorization: await authorization() },
+      }),
+      environment,
+      writeAuthorizer,
+    );
+    expect(unassignedLookup.status).toBe(403);
+
+    cacheAssignment.mockResolvedValue({
+      jobId: "assigned-job",
+      cacheScope: { scope: "refs/pull/2/merge", writeAllowed: true },
+    });
 
     const assigned = await handleRunnerCacheV2Request(
       new Request("https://runner.example/v1/runner-cache-v2/assignment", {
@@ -521,7 +542,7 @@ describe("runner R2 cache", () => {
       writeAuthorizer,
     );
     expect(assigned.status).toBe(200);
-    await expect(assigned.json()).resolves.toEqual({ ok: true });
+    await expect(assigned.json()).resolves.toEqual({ ok: true, cache: true });
   });
 
   it("passes the workflow run hint only after authenticating the runner capability", async () => {
@@ -531,7 +552,8 @@ describe("runner R2 cache", () => {
       .mockResolvedValue({ jobId: "assigned-job", cacheScope: { scope: "refs/pull/2/merge", writeAllowed: true } });
     const endpoint = "https://runner.example/v1/runner-cache-v2/assignment?run_id=12345";
     const unauthorized = await handleRunnerCacheV2Request(new Request(endpoint), environment, { cacheAssignment });
-    expect(unauthorized.status).toBe(401);
+    expect(unauthorized.status).toBe(200);
+    await expect(unauthorized.json()).resolves.toEqual({ ok: false, cache: false });
     expect(cacheAssignment).not.toHaveBeenCalled();
     const assigned = await handleRunnerCacheV2Request(
       new Request(endpoint, {

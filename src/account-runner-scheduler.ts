@@ -1548,14 +1548,16 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       // Attach the runner to the job actually running so the displaced job is
       // not requeued behind a runner that will never exist.
       const actualJob = this.job(input.jobId);
-      // `provisioning` is excluded deliberately: an in-flight provisioning
-      // workflow for that job would observe `canStart() === false` after the
-      // rename and tear the adopted job down via provisioningFailed.
+      // provisioningFailed is scoped to the runner name, so the superseded
+      // provisioning workflow cannot tear down a job adopted by this runner.
       if (
         assignmentRecorded &&
         actualJob !== undefined &&
         jobMatchesRunnerClaim(actualJob, input) &&
-        (actualJob.status === "queued" || actualJob.status === "admitted" || actualJob.status === "running")
+        (actualJob.status === "queued" ||
+          actualJob.status === "admitted" ||
+          actualJob.status === "provisioning" ||
+          actualJob.status === "running")
       ) {
         this.ctx.storage.sql.exec(
           `UPDATE scheduler_jobs

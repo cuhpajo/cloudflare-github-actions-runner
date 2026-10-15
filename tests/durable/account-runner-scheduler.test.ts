@@ -258,6 +258,66 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     });
   });
 
+  it("adopts a provisioning job onto an unowned runner after a three-way assignment", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("three-way-provisioning-assignment");
+    const jobA = job("910", "cf-standard-3-job-910", "refs/pull/910/merge");
+    const jobB = job("911", "cf-standard-3-job-911", "refs/pull/911/merge");
+    const jobC = job("912", "cf-standard-3-job-912", "refs/pull/912/merge");
+
+    await scheduler.submit(jobA);
+    await scheduler.submit(jobB);
+    await scheduler.submit(jobC);
+    await provisionRunner(scheduler, jobA.jobId, jobA.runnerName, 9_101);
+    await provisionRunner(scheduler, jobC.jobId, jobC.runnerName, 9_103);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec(
+        `UPDATE scheduler_jobs SET status = 'provisioning', slot_id = 'preset:standard-3' WHERE job_id = ?`,
+        jobB.jobId,
+      );
+    });
+
+    // Moving A onto C's runner leaves A's live runner without an owner row.
+    // GitHub can assign B to that runner while B's own runner is still starting.
+    await expect(
+      scheduler.workflowJobStarted({
+        jobId: jobA.jobId,
+        runnerName: jobC.runnerName,
+        runnerId: 9_103,
+        target,
+        profile,
+      }),
+    ).resolves.toMatchObject({ accepted: true });
+    await expect(
+      scheduler.workflowJobStarted({
+        jobId: jobB.jobId,
+        runnerName: jobA.runnerName,
+        runnerId: 9_101,
+        target,
+        profile,
+      }),
+    ).resolves.toMatchObject({ accepted: true });
+
+    await expect(scheduler.cacheAssignment(jobA.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: jobB.jobId,
+      cacheScope: {
+        scope: jobB.cacheScope?.scope,
+        fallbackScope: "refs/heads/main",
+        writeAllowed: true,
+      },
+    });
+    await expect(scheduler.canStart(jobB.jobId, jobB.runnerName)).resolves.toBe(false);
+
+    await scheduler.provisioningFailed(jobB.jobId, "superseded provisioning workflow", jobB.runnerName);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      // SAFETY: the query selects exactly these two columns and every row carries them.
+      const surviving = state.storage.sql
+        .exec(`SELECT status, runner_name FROM scheduler_jobs WHERE job_id = ?`, jobB.jobId)
+        .toArray()[0] as { status: string; runner_name: string };
+      expect(surviving.status).toBe("running");
+      expect(surviving.runner_name).toBe(jobA.runnerName);
+    });
+  });
+
   it("ignores a failure report from a superseded provisioning attempt", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("stale-provisioning-failure");
     const queuedJob = job("950", "cf-standard-3-job-950", "refs/pull/950/merge");

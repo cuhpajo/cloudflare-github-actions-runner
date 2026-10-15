@@ -1001,6 +1001,12 @@ export async function handleRunnerCacheV2Request(
   }
   const claim = await authenticatedRunnerCacheClaim(request, env);
   if (claim === undefined) {
+    if (request.method === "GET" && url.pathname === "/v1/runner-cache-v2/assignment") {
+      // The pre-job hook only needs permission to run. Cache operations still
+      // require a valid claim even when the job proceeds without caching.
+      console.log("Cloudflare runner cache assignment unauthenticated; job runs without cache");
+      return json({ ok: false, cache: false }, 200);
+    }
     return json({ error: "Unauthorized" }, 401);
   }
   const runId =
@@ -1011,12 +1017,25 @@ export async function handleRunnerCacheV2Request(
     return json({ error: "Invalid workflow run ID" }, 400);
   }
   const resolved = await resolveRunnerCacheClaim(writeAuthorizer, claim, runId);
-  // GitHub can start a JIT runner a moment before its authoritative
-  // `workflow_job: in_progress` webhook reaches this Worker. The runner's
-  // pre-job hook polls this endpoint, so actions/cache never observes that
-  // short-lived unassigned state as an insecure 403 response.
   if (request.method === "GET" && url.pathname === "/v1/runner-cache-v2/assignment") {
-    return json({ ok: resolved !== undefined }, resolved === undefined ? 202 : 200);
+    // Briefly wait for GitHub's assignment, then let the job proceed. Every
+    // cache operation below resolves the assignment again and denies access
+    // until it is confirmed.
+    let assigned = resolved;
+    for (let attempt = 0; assigned === undefined && attempt < 3; attempt += 1) {
+      // eslint-disable-next-line no-await-in-loop -- assignment observation is a bounded sequential retry.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      // eslint-disable-next-line no-await-in-loop -- each retry must observe fresh scheduler state.
+      assigned = await resolveRunnerCacheClaim(writeAuthorizer, claim, runId);
+    }
+    if (assigned === undefined) {
+      console.log("Cloudflare runner cache assignment unconfirmed; job runs without cache", {
+        runnerName: claim.runnerName,
+        jobId: claim.jobId,
+        runId,
+      });
+    }
+    return json({ ok: assigned !== undefined, cache: assigned !== undefined }, 200);
   }
   if (resolved === undefined) {
     return json({ ok: false, message: "cache runner is not assigned to a GitHub job" }, 403);
